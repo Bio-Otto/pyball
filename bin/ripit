@@ -1,0 +1,946 @@
+#!/usr/bin/env python
+
+__doc__ = """
+Run RIP residue perturbation MD simulations for a 
+PDB structure. Note residues are counted from 0, 
+which is Python-style counting
+
+Usage: ripit prep high_rip <pdb> <out_dir>
+       ripit prep low_rip <pdb> <out_dir>
+       ripit run <param> ...
+       ripit extract couplings <pdb> <rip_dir>
+       ripit extract flexibility <pdb> <rip_dir>
+       ripit html flexibility <flexibility_dir>
+       ripit html couplings <couplings_dir>
+
+Example: Generate the config files for a set of MD
+runs for a high temperature RIP run.
+
+    >>> ripit high example.pdb high_rip
+
+Example: Generate the config files for a set of MD
+runs for a high temperature RIP run.
+
+    >>> ripit low example.pdb low_rip
+
+"""
+
+import os
+import glob
+import time
+import math
+import shutil
+import re
+
+import numpy as np
+
+from pdbremix import pdbatoms
+from pdbremix import simulate
+from pdbremix.lib.docopt import docopt
+from pdbremix import force
+from pdbremix import util
+from pdbremix import pdbtext
+from pdbremix import trajectory
+from pdbremix import fetch
+from pdbremix import data
+from pdbremix import v3
+from pdbremix import trajectory
+from pdbremix import pymol
+from pdbremix import protein
+
+
+
+def run_equil(params):
+  pdb = params['pdb']
+  clean_pdb = os.path.split(pdb)[-1] + '.clean.pdb'
+  print os.getcwd(), clean_pdb
+  pdbtext.clean_pdb(pdb, clean_pdb)
+
+  print "> Generating topologies"
+  top, crds = simulate.pdb_to_top_and_crds(
+      params['ff'], clean_pdb, 'sim')
+
+  util.goto_dir('equil')
+
+  temperature = params['equil_temperature']
+
+  simulate.minimize(params['ff'], '../sim', 'min', n_step=10000)
+
+  print "> Heating to %dK" % temperature
+  simulate.langevin_thermometer(
+      params['ff'], 'min', 1000, temperature, 'heat1', 50)
+
+  print "> Constant energy relaxation"
+  simulate.constant_energy(
+      params['ff'], 'heat1', 10000, 'const2', 50)
+
+  print "> Reheat to %dK" % temperature
+  simulate.langevin_thermometer(
+      params['ff'], 'const2', 1000, temperature, 'heat3', 50)
+
+  print "> Constant energy relaxation"
+  simulate.constant_energy(
+      params['ff'], 'heat3', 10000, 'const4', 50)
+
+  print "> Reheat to %dK" % temperature
+  simulate.langevin_thermometer(
+      params['ff'], 'const4', 1000, temperature, 'heat5', 50)
+
+  print "> Merge into single equil trajecotry"
+  simulate.merge_trajectories(
+      params['ff'], 'equil', 
+      ['heat1', 'const2', 'heat3', 'const4', 'heat5'])
+
+  util.write_dict('equil.config', params)
+
+  util.goto_dir('..')
+
+
+def run_or_wait_for_equil(params):
+  sim_dir = params['sim_dir']
+  util.goto_dir(sim_dir)
+  print sim_dir
+  if os.path.isdir('equil'):
+    while not os.path.isfile('equil/equil.config'):
+      time.sleep(1)
+      print "Waiting for equil to finish..."
+    return
+  run_equil(params)
+
+
+def run_puff(params):
+  util.goto_dir(params['sim_dir'])
+
+  i_residue = params['i_residue']
+  res_dir = os.path.join(params['var_name'], params['resnum'])
+  restraint_pdb = ''
+  in_md = os.path.abspath('equil/equil')
+
+  print "> Pulse with RIP on %s" % params['resnum']
+
+  util.goto_dir(res_dir)
+  simulate.pulse(
+      params['ff'], 
+      in_md,  
+      'md', 
+      params['n_step'],
+      force.make_rip_fn(
+          params['i_residue'],
+          params['rip_temperature']), 
+      100,
+      restraint_pdb=restraint_pdb)
+
+
+def process_config(config):
+  done = config + '.done'
+  save_dir = os.getcwd()
+  if not os.path.isfile(done):
+    params = util.read_dict(config)
+    run_or_wait_for_equil(params)
+    run_puff(params)
+    os.chdir(save_dir)
+    open(done, 'w').write('done')
+
+
+def is_rippable_res(res):
+  res_type = res.type
+  if res_type in data.solvent_res_types:
+    return False
+  if res_type in ['PRO', 'GLY']:
+    return False
+  if not res.has_atom('CA'):
+    return False
+  return force.get_n_chi(res) > 0
+
+
+def prepare_high(pdb, sim_dir):
+  if not sim_dir:
+    sim_dir = os.getcwd()
+  sim_dir = os.path.abspath(sim_dir)
+  pdb = os.path.abspath(pdb)
+  soup = pdbatoms.Soup(pdb)
+  pdb_code = os.path.splitext(pdb)[0]
+  var_name = 'high_rip'
+  for i_res, res in enumerate(soup.residues()):
+    if not is_rippable_res(res):
+      continue
+    resnum = 'res%d' % (i_res+1)
+    config = '%s.%s.%s.config' % (pdb_code, var_name, resnum)
+    print res.tag(), res.type, '->', util.relpath(config)
+    params = {
+      'ff': 'AMBER14-GBSA',
+      'pdb': pdb,
+      'i_residue': i_res,
+      'resnum': resnum,
+      'rip_temperature': 300,
+      'equil_temperature': 300,
+      'n_step': 10000, 
+      'var_name': var_name,
+      'sim_dir': sim_dir,
+    }
+    util.write_dict(config, params)
+
+
+def prepare_low(pdb, sim_dir):
+  if not sim_dir:
+    sim_dir = os.getcwd()
+  sim_dir = os.path.abspath(sim_dir)
+  pdb = os.path.abspath(pdb)
+  soup = pdbatoms.Soup(pdb)
+  pdb_code = os.path.splitext(pdb)[0]
+  var_name = 'low_rip'
+  for i_res, res in enumerate(soup.residues()):
+    if not is_rippable_res(res):
+      continue
+    resnum = 'res%d' % (i_res+1)
+    config = '%s.%s.%s.config' % (pdb_code, var_name, resnum)
+    print res.tag(), res.type, '->', util.relpath(config)
+    params = {
+      'ff': 'AMBER14-GBSA',
+      'pdb': pdb,
+      'i_residue': i_res,
+      'resnum': resnum,
+      'rip_temperature': 26,
+      'equil_temperature': 10,
+      'n_step': 5000, 
+      'var_name': var_name,
+      'sim_dir': sim_dir,
+    }
+    util.write_dict(config, params)
+
+
+############################################
+# residue MD directories referencing functions
+
+
+def get_i_residue_resnum(fname):
+  m = re.search(r'res(\d+)', fname)
+  if not m:
+    return '', -1
+  resnum = m.group(0)
+  i_residue = int(m.group(1))-1
+  return i_residue, resnum
+
+
+def get_res_dir_list(rip_dir):
+  res_dir_pairs = []
+  for test_dir in glob.glob(os.path.join(rip_dir, '*')):
+    if not os.path.isdir(test_dir):
+      continue
+    i_residue, resnum = get_i_residue_resnum(test_dir)
+    if resnum == '':
+      continue
+    res_dir_pairs.append((i_residue, test_dir))
+  res_dir_pairs.sort()
+  return res_dir_pairs
+
+
+############################################
+# 2D-nmatrix functions
+
+
+def get_matrix_from_dir(
+    n_res, rip_dir, md_var_fname='md.dev.per_frame'):
+  matrix = np.zeros((n_res, n_res))
+  for i_res, res_dir in get_res_dir_list(rip_dir):
+    print i_res, res_dir
+    fname = os.path.join(res_dir, md_var_fname)
+    if not os.path.isfile(fname):
+      md = os.path.join(res_dir, 'md')
+      trajectory.analyze_trajectory(md)
+    last_line = open(fname).readlines()[-1]
+    words = last_line.split()
+    matrix[i_res][:] = map(float, words[1:])
+  return matrix
+
+
+def make_block_matrix(matrix, min_val):
+  """
+  Uses a min_val cutoff and converts a float-based matrix
+  array into a binary 1,0 array.
+  """
+  result = matrix.copy()
+  n_x, n_y = np.shape(matrix)
+  for i in range(n_x):
+    for j in range(n_y):
+      if result[i,j] > min_val:
+        result[i,j] = 1
+      else:
+        result[i,j] = 0
+  return result
+
+
+def count_vals_over_min_per_column(matrix, min_val):
+  block_matrix = make_block_matrix(matrix, min_val)
+  n_bin = block_matrix.shape[0]
+  for i in range(n_bin):
+    block_matrix[i,i] = 0
+  result = np.zeros(n_bin, int)
+  for i in range(n_bin):
+    result[i] = sum(block_matrix[i,:])
+  return result
+
+
+def write_matrix(matrix, fname):
+  n_bin = matrix.shape[0]
+  lines = []
+  for j in range(n_bin):
+    strs = [str(val) for val in matrix[:,j]]
+    line = ' '.join(strs)
+    lines.append(line)
+  open(fname, 'w').write('\n'.join(lines))
+
+
+def read_matrix(fname):
+  result = None
+  n = None
+  j = 0
+  for line in open(fname):
+    words = line.split()
+    if len(words) == 0:
+      continue
+    if n is None:
+      n = len(words)
+      result = np.zeros((n, n))
+    result[:,j] = map(float, words)
+    j += 1
+  return result
+
+
+def get_cutoff_from_matrix(matrix):
+  vals = [d for d in matrix.flatten() if d > 0.0]
+  n = float(len(vals))
+  avg = sum(vals)/n
+  var = sum((v-avg)**2 for v in vals)/n
+  std = math.sqrt(var)
+  return avg + 2.0*std
+
+
+def write_vals(vals, fname):
+  line = ' '.join(map(str, vals))
+  open(fname, 'w').write(line)
+
+
+def write_bfactor_pdb(soup, bfactors, pdb):
+  for a in soup.atoms():
+    a.bfactor = 0.0
+  residues = [r for r in soup.residues() if r.has_atom('CA')]
+  for bfactor, res in zip(bfactors, residues):
+    for a in res.atoms():
+      a.bfactor = bfactor
+  soup.write_pdb(pdb)
+
+
+def make_ticks_labels(n):
+  steps = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500]
+  for step in steps:
+    if int(n/step) <= 10:
+      break
+  labels = [1] + list(range(step, n + 1, step)) + [n]
+  labels = list(sorted(set(labels)))
+  ticks = [x - 1 for x in labels]
+  labels = map(str, labels)
+  return ticks, labels
+
+
+def write_matrix_png(matrix, png, max_val=None):
+  pylab.clf()
+  ax = pylab.gca()
+  
+  # draw heat map
+  plot = pylab.imshow(matrix, interpolation='none', vmax=max_val)
+  plot.set_cmap('Reds')
+  pylab.colorbar()
+
+  # draw diagonal lines of green circles
+  x_vals, y_vals = [], []
+  n = matrix.shape[0]
+  size = int((350/float(n))**2)
+  if size==0:
+    size = 1
+  for i in range(n):
+    if sum(matrix[i,:]) > 0:
+      x_vals.append(i)
+      y_vals.append(i)
+  if x_vals:
+    pylab.scatter(
+        x_vals, y_vals, s=size, marker='o', 
+        facecolor='g', edgecolor='none') 
+
+  pylab.xlim([-0.5, n-0.5])
+  pylab.ylim([-0.5, n-0.5])
+
+  # renumber for 1-based for residues
+  ticks, labels = make_ticks_labels(n)
+  ax.set_xticks(ticks)
+  ax.set_xticklabels(labels)
+  ax.set_yticks(ticks)
+  ax.set_yticklabels(labels)
+
+  pylab.savefig(png)
+
+
+############################################
+# RIP-flexibility analysis
+
+
+def get_fluctuations_per_column(matrix, min_val):
+  n_residue = matrix.shape[0]
+  y_vals = []
+  for j in range(n_residue):
+    fluctuations = []
+    for i in range(n_residue):
+      v = matrix[i,j]
+      if abs(i-j) > 3 and v > min_val:
+        fluctuations.append(v-min_val)
+    if fluctuations:
+      mean = sum(fluctuations)/float(len(fluctuations))
+    else:
+      mean = 0.0
+    y_vals.append(mean)
+  return y_vals
+
+
+def analyze_flex_rip_dir(pdb, rip_dir):
+  min_val, max_val = 6, 10
+  out_dir = os.path.join(rip_dir, '..', 'flexibility')
+  if not os.path.isdir(out_dir):
+    os.makedirs(out_dir)
+
+  soup = pdbatoms.Soup(pdb)
+  shutil.copy(pdb, os.path.join(out_dir, 'ref.pdb'))
+
+  n_res = len(soup.residues())
+  matrix = get_matrix_from_dir(n_res, rip_dir, 'md.dev.per_frame')
+
+  write_matrix(matrix, os.path.join(out_dir, 'map.txt'))
+  
+  vals = count_vals_over_min_per_column(matrix, min_val)
+  write_bfactor_pdb(
+      soup, vals, os.path.join(out_dir, 'strength.pdb'))
+  write_vals(vals, os.path.join(out_dir, 'strength.txt'))
+
+  vals = count_vals_over_min_per_column(matrix.transpose(), min_val)
+  write_bfactor_pdb(
+      soup, vals, os.path.join(out_dir, 'flexibility.pdb'))
+  write_vals(vals, os.path.join(out_dir, 'flexibility.txt'))
+
+  vals = get_fluctuations_per_column(matrix, min_val)
+  write_bfactor_pdb(
+      soup, vals, os.path.join(out_dir, 'fluctuation.pdb'))
+  write_vals(vals, os.path.join(out_dir, 'fluctuation.txt'))
+  
+  for i_res, res_dir in get_res_dir_list(rip_dir):
+    res_pdb = os.path.join(res_dir, 'md.last.pdb')
+    res_soup = pdbatoms.Soup(res_pdb)
+    bfactors = matrix[i_res,:]
+    out_pdb = os.path.join(out_dir, 'dev.res%d.pdb' % (i_res+1))
+    write_bfactor_pdb(res_soup, bfactors, out_pdb)
+
+
+
+flex_template = """
+<html>
+<head>
+  <title>{{attributes['name']}}</title>
+  <style>
+    html {
+      font-family: Helvetica;
+    }
+    div {
+      float: left;
+      padding: 2em 1em 0 0;
+      width:260px;
+    }
+  </style>
+</head>
+<body>
+  <h1> {{attributes['name']}} </h1>
+  <div style="width:400px">
+    <img style="width:400px" src="map.png">
+    <br>
+    RMSD fluctuation map; each row corresponds to a RIP simulation.
+  </div>
+  <div>
+    <img style="width:260px" src="strength.png">
+    <br>
+    Red(10): number of residues perturbed by this residue
+  </div>
+  <div>
+    <img style="width:260px" src="flexibility.png">
+    <br>
+    Red(10): number of residues that can perturb this residue
+  </div>
+  <div>
+    <img style="width:260px" src="fluctuation.png">
+    <br>
+    Red(5.0): average amount of RMSD fluctuation
+  </div>
+
+  <br clear="all">
+
+  {% for entry in attributes['residues']: %}
+    <div style="float:left; padding:2em 0.5em 0em 0em;">
+      {{entry['resnum']}}
+      <br/>
+      <img style="width:260px" src="{{entry['plot_png']}}">
+    </div>
+  {% endfor %}
+
+</body></html>
+"""
+
+
+def make_bfactor_png(
+    pdb, png, upper_bfactor=15, is_putty=False, highlight_res=None):
+  if os.path.isfile(png):
+    return
+  soup = pdbatoms.Soup(pdb)
+  bfactors = []
+  for res in soup.residues():
+    if res.has_atom('CA'):
+      bfactors.append(res.atom('CA').bfactor)
+  pymol.soup_to_bfactor_png(
+      soup, png, bfactors, 
+      highlight_res=highlight_res,
+      upper_bfactor=upper_bfactor, 
+      is_putty=is_putty)
+
+
+def make_html_in_flex_dir(flex_dir):
+  save_dir = os.getcwd()
+  os.chdir(flex_dir)
+
+  attributes = {}
+  attributes['name'] = 'flexibility analysis'
+  attributes['residues'] = []
+
+  max_rmsd = 10
+  matrix = read_matrix('map.txt')
+  write_matrix_png(matrix, 'map.png', max_rmsd)
+
+  make_bfactor_png('strength.pdb', 'strength.png', 10, False)
+  make_bfactor_png('flexibility.pdb', 'flexibility.png', 10, True)
+  make_bfactor_png('fluctuation.pdb', 'fluctuation.png', 5, True)
+
+  pdb_pairs = []
+  for dev_pdb in glob.glob('dev*pdb'):
+    i_residue, resnum = get_i_residue_resnum(dev_pdb)
+    pdb_pairs.append((i_residue, resnum, dev_pdb))
+  pdb_pairs.sort()
+
+  soup = pdbatoms.Soup('ref.pdb')
+  for i_residue, resnum, dev_pdb in pdb_pairs:
+    png = dev_pdb.replace('.pdb', '.png')
+    highlight_res = str(i_residue+1)
+    make_bfactor_png(dev_pdb, png, 10, True, highlight_res)
+    res_type = soup.residue(i_residue).type
+    attributes['residues'].append({
+        'resnum': '%s-%s' % (resnum.upper(), res_type),
+        'plot_png': png
+    })
+
+  html = Template(flex_template).render(attributes=attributes)
+  open('index.html', 'w').write(html)
+
+  os.chdir(save_dir)
+
+
+###################################################
+# COUPLING analysis routines
+
+
+
+def merge_residues(residues1, residues2):
+  for i in residues2:
+    if i not in residues1:
+      residues1.append(i)
+  
+  
+def get_connected_residues(i, residues, soup):
+  connected_residues = [i]
+  neighbors = [j for j in residues if protein.is_connected(i, j, soup)]
+  connected_residues.extend(neighbors)
+  non_neighbors = [j for j in residues if j not in neighbors]
+  if non_neighbors:
+    for j in neighbors:
+      connected_to_j = \
+          get_connected_residues(j, non_neighbors, soup)
+      merge_residues(connected_residues, connected_to_j)
+  return connected_residues
+
+
+def indices_above_threshold(matrix, i, min_val):
+  n = matrix.shape[0]
+  return [j for j in range(n) if matrix[i,j] >= min_val and i != j]
+
+
+def neighbors_above_threshold(i, matrix, min_val, soup):
+  residues = indices_above_threshold(matrix, i, min_val)
+  return [j for j in residues if protein.is_sidechain_connected(i, j, soup)]
+
+  
+def filter_disconnected_residues(i, matrix, min_val, soup):
+  n_res = matrix.shape[0]
+  residues = indices_above_threshold(matrix, i, min_val)
+  neighbors = [j for j in residues 
+               if protein.is_sidechain_connected(i, j, soup)]
+  non_neighbors = [j for j in residues if j not in neighbors]
+  connected_residues = [i]
+  for j in neighbors:
+    connected_to_j = \
+        get_connected_residues(j, non_neighbors, soup)
+    merge_residues(connected_residues, connected_to_j)
+  for j in range(n_res):
+    if j not in connected_residues:
+      matrix[i, j] = 0.0    
+
+
+def filter_indirectly_coupled(i, matrix, min_val, soup):
+  n_res = matrix.shape[0]
+  residues = indices_above_threshold(matrix, i, min_val)
+  neighbors = [j for j in residues 
+               if protein.is_sidechain_connected(i, j, soup)]
+  for j in range(n_res):
+    if j not in neighbors:
+      matrix[i, j] = 0.0    
+
+
+def filter_immediate_neighbors(i, matrix, min_val):
+  n_res = matrix.shape[0]
+  test_j = [j for j in range(i-2, i+2+1) 
+            if j>=0 and j<n_res and i!=j]
+  for j in test_j:
+    matrix[i,j] = 0.0
+
+
+def make_pathway_from_heatflow(heatflow, min_val, pdb):
+  soup = pdbatoms.Soup(pdb)
+  pathway = heatflow.copy()
+  n_res = pathway.shape[0]
+  for i in range(n_res):
+    for j in range(n_res):
+      if pathway[i,j] <= min_val:
+        pathway[i,j] = 0.0
+    filter_immediate_neighbors(i, pathway, min_val)
+    filter_disconnected_residues(
+        i, pathway, min_val, soup)
+  return pathway
+
+
+def make_coupling_from_pathway(pathway, min_val, pdb):
+  n_res = pathway.shape[0]
+  coupling = np.zeros((n_res, n_res), float)
+  soup = pdbatoms.Soup(pdb)
+  for i in range(n_res):
+    for j in neighbors_above_threshold(
+        i, pathway, min_val, soup):
+      coupling[i,j] = 1.0
+  return coupling
+
+
+def make_tertiary_from_coupling(coupling, pdb):
+  soup = pdbatoms.Soup(pdb)
+  protein.find_ss_by_bb_hbonds(soup)
+  residues = soup.residues()
+  n_res = coupling.shape[0]
+  tertiary = np.zeros((n_res, n_res), float)
+  for i in range(n_res):
+    for j in range(n_res):
+      if coupling[i, j] and not j in residues[i].ss_contacts:
+          tertiary[i, j] = 1.0
+  return tertiary
+
+
+def plot_heat_png(png, y_vals, y_min, y_max, i_res):
+  pylab.clf()
+  ax = pylab.gca()
+  n_res = len(y_vals)
+
+  # draw heat for all residues
+  x_vals = [i-0.5+0.1 for i in range(n_res)]
+  pylab.bar(x_vals, y_vals, color='#DDAAAA', edgecolor='none', width=1.0)
+ 
+  # highlight RIP'ed residue
+  just_rip = [0 for i in range(len(y_vals))]
+  just_rip[i_res] = y_vals[i_res]
+  pylab.bar(x_vals, just_rip, color='#009900', edgecolor='none', width=1.0)
+
+  # draw 95% cutoff for min_val
+  pylab.plot([-0.5, n_res], [y_min, y_min], color="red")
+
+  pylab.xlim([-0.5, n_res-0.5])
+  pylab.ylim([0, y_max])
+
+  # renumber for 1-based for residues
+  ticks, labels = make_ticks_labels(n_res)
+  ax.set_xticks(ticks)
+  ax.set_xticklabels(labels)
+
+  pylab.savefig(png)
+
+
+def write_coupling_pdb(soup, i_res, j_res, coupling_pdb):
+  bfactors = [0 for i in range(len(soup.residues()))]
+  bfactors[i_res] = 2.0
+  bfactors[j_res] = 1.0
+  write_bfactor_pdb(soup, bfactors, coupling_pdb)
+
+
+def write_cumulative_coupling_pdb(png, pdb, matrix):
+  soup = pdbatoms.Soup(pdb)
+  n_res = len(soup.residues())
+  residues = [0 for i in range(n_res)]
+  for i_res in range(n_res):
+    for j_res in range(n_res):
+      if matrix[i_res,j_res] > 0:
+        residues[i_res] = 1
+        residues[j_res] = 1 
+  write_bfactor_pdb(soup, residues, png)
+
+
+def analyze_couplings_rip_dir(pdb, rip_dir):
+  out_dir = os.path.join(rip_dir, '..', 'couplings')
+  if not os.path.isdir(out_dir):
+    os.makedirs(out_dir)
+
+  shutil.copy(pdb, os.path.join(out_dir, 'ref.pdb'))
+
+  n_res = len(pdbatoms.Soup(pdb).residues())
+  heatflow = get_matrix_from_dir(
+      n_res, rip_dir, 'md.kin.per_frame')
+  write_matrix(
+      heatflow, os.path.join(out_dir, 'heatflow.txt'))
+
+
+couplings_template = """
+<html>
+<head>
+  <title>{{attributes['name']}}</title>
+  <style>
+    html {
+      font-family: Helvetica;
+    }
+    body {
+      padding: 50px;
+    }
+    div {
+      float: left;
+      padding-top: 1.5em;
+      width:260px;
+    }
+  </style>
+</head>
+<body>
+  <h1> {{attributes['name']}} </h1>
+  <div style="width:400px">
+    <img style="width:400px" src="heatflow.png">
+    <br>
+    Energy flow map; each row corresponds to a RIP simulation.
+  </div>
+  <div style="width:400px" >
+    <img style="width:400px" src="pathway.png">
+    <br>
+    Connected Pathways; energy above threshold, links connected residues to RIP residue, exclude sequential neighbors.
+  </div>
+  <div style="width:400px" >
+    <img style="width:400px" src="coupling.png">
+    <br>
+    Couplings: directly connected residues.
+  </div>
+  <div style="width:400px" >
+    <img style="width:400px" src="tertiary.png">
+    <br>
+    Tertiary couplings: couplings not in same secondary structure
+  </div>
+  
+  <br clear=all>
+  <br>
+  <br>
+
+  <table width="100%" style="width:100%; border-top:1px solid #AAA;">
+    <td width="250px" style="border-right:1px solid #AAA; vertical-align:top;">
+      <div> Heat Response </div>
+    </td>
+    <td>
+      <table width="100%; height=100%">
+        <td width="50%" style="padding:0 1.5em 1.5em 1.5em; background-color:#FFF9F9; border-right:1px solid #AAA; ">
+          <div style="width:100%"> Tertiary Couplings </div>
+        </td>
+        <td width="50%" style="padding:0 1.5em 1.5em 1.5em; background-color:#F9F9FF; vertical-align:top;">
+          <div style="width:100%"> Same Secondary-Structure Couplings </div>
+        </td>
+      </table>
+    </td>
+  </table>
+
+  {% for entry in attributes['residues']: %}
+  <table width="100%" style="width:100%; border-top:1px solid #AAA;">
+    <td width="250px" style="border-right:1px solid #AAA; vertical-align:top;">
+      <div>
+        {{entry['resnum']}}
+        <br/>
+        <img style="width:250px" src="{{entry['png']}}">
+      </div>
+    </td>
+    <td>
+      <table width="100%; height=100%">
+        <td width="50%" style="padding:0 1.5em 1.5em 1.5em; background-color:#FFF9F9; border-right:1px solid #AAA; ">
+          <div style="min-height:200px; width:100%; vertical-align:top; padding:0;">
+            {% for title, pdb_png in entry['tertiary_pdb_pngs']: %}
+              <div style="float:left; padding-right:1em">
+                {{title}}
+                <br>
+                <img style="height:250px" src="{{pdb_png}}">
+              </div>
+            {% endfor %}
+          </div>
+        </td>
+        <td width="50%" style="padding:0 1.5em 1.5em 1.5em; background-color:#F9F9FF; vertical-align:top;">
+          <div style="min-height:200px; width: 100%; vertical-align:top; padding:0;">
+            {% for title, pdb_png in entry['non_tertiary_pdb_pngs']: %}
+              <div style="float:left; padding-right:1em">
+                {{title}}
+                <br>
+                <img style="height:250px" src="{{pdb_png}}">
+              </div>
+            {% endfor %}
+          </div>
+        </td>
+      </table>
+    </td>
+  </table>
+  {% endfor %}
+</body>
+</html>
+"""
+
+
+def make_coupling_png(pdb, png):
+  if os.path.isfile(png):
+    return
+  soup = pdbatoms.Soup(pdb)
+  bfactors = []
+  highlight_res = None
+  for i_res, res in enumerate(soup.residues()):
+    if res.has_atom('CA'):
+      bfactor = res.atom('CA').bfactor
+      bfactors.append(bfactor)
+      if bfactor > 1.0:
+        highlight_res=str(i_res+1)
+  pymol.soup_to_bfactor_png(
+      soup, png, bfactors, 
+      highlight_res=highlight_res,
+      lower_bfactor=0.5,
+      upper_bfactor=1.0,
+      is_putty=False)
+
+
+def make_html_in_couplings_dir(couplings_dir):
+
+  save_dir = os.getcwd()
+  os.chdir(couplings_dir)
+  pdb = 'ref.pdb'
+
+  heatflow = read_matrix('heatflow.txt')
+  write_matrix_png(heatflow, 'heatflow.png')
+
+  min_val = get_cutoff_from_matrix(heatflow)
+  max_val = min_val*2.0
+  n_res = heatflow.shape[0]
+
+  pathway = make_pathway_from_heatflow(heatflow, min_val, pdb)
+  write_matrix(pathway, 'pathway.txt')
+  write_matrix_png(pathway, 'pathway.png')
+  
+  coupling = make_coupling_from_pathway(pathway, min_val, pdb)
+  write_matrix(coupling, 'coupling.txt')
+  write_matrix_png(coupling, 'coupling.png')
+  write_cumulative_coupling_pdb('coupling.pdb', pdb, coupling)
+
+  tertiary = make_tertiary_from_coupling(coupling, pdb)
+  write_matrix(tertiary, 'tertiary.txt')
+  write_matrix_png(tertiary, 'tertiary.png')
+  write_cumulative_coupling_pdb('tertiary.pdb', pdb, tertiary)
+
+  soup = pdbatoms.Soup(pdb)
+  n_res = len(soup.residues())
+  for i_res in range(n_res):
+    for j_res in range(n_res):
+      if coupling[i_res,j_res] > 0:
+        coupling_pdb = 'coupling.res%d.res%d.pdb' % (i_res+1, j_res+1)
+        write_coupling_pdb(soup, i_res, j_res, coupling_pdb)
+
+  attributes = { 'name': 'Heat Flow', 'residues': [] }
+
+  for i_res1 in range(n_res):
+    if not sum(heatflow[i_res1]) > 0:
+      continue
+
+    resnum1 = 'res%d' % (i_res1+1)
+    res_type1 = soup.residue(i_res1).type
+    res_tag1 = '%s-%s' % (resnum1.upper(), res_type1)
+
+    heat_png = 'heat.%s.png' % resnum1
+    if not os.path.isfile(heat_png):
+      plot_heat_png(heat_png, heatflow[i_res1], min_val, 0.2, i_res1)
+
+    entry = { 
+        'resnum': res_tag1,
+        'png': heat_png,
+        'tertiary_pdb_pngs': [],
+        'non_tertiary_pdb_pngs': [],
+    }
+
+    for fname in glob.glob('coupling.' + resnum1 + '.*'):
+      m = re.search(r'coupling\.res\d+\.(res\d+).pdb', fname)
+      if not m:
+        continue
+      resnum2 = m.group(1)
+      m = re.search(r'res(\d+)', resnum2)
+      i_res2 = int(m.group(1)) - 1
+      res_type2 = soup.residue(i_res2).type
+      res_tag2 = resnum2.upper() + '-' + res_type2
+
+      pdb = 'coupling.%s.%s.pdb' % (resnum1, resnum2)
+      png = pdb.replace('.pdb', '.png')
+      make_coupling_png(pdb, png)
+
+      if tertiary[i_res1, i_res2]:
+        entry['tertiary_pdb_pngs'].append(('-> '+res_tag2, png))
+      else:
+        entry['non_tertiary_pdb_pngs'].append(('-> '+res_tag2, png))
+
+    attributes['residues'].append(entry)
+
+  html = Template(couplings_template).render(attributes=attributes)
+  open('index.html', 'w').write(html)
+
+  os.chdir(save_dir)
+
+
+if __name__ == "__main__":
+  args = docopt(__doc__)
+  if  args['prep']:
+    if args['high_rip']:
+      prepare_high(args['<pdb>'], args['<out_dir>'])
+    elif args['low_rip']:
+      prepare_low(args['<pdb>'], args['<out_dir>'])
+  if args['run']:
+    for param in args['<param>']:
+      process_config(param)
+  if args['extract']:
+    if args['flexibility']:
+      analyze_flex_rip_dir(args['<pdb>'], args['<rip_dir>'])
+    if args['extract'] and args['couplings']:
+      analyze_couplings_rip_dir(args['<pdb>'], args['<rip_dir>'])
+  if args['html']:
+    # only import here, allowing clusters to work with other part
+    from matplotlib import pylab
+    from jinja2 import Template
+    if args['flexibility']:
+      make_html_in_flex_dir(args['<flexibility_dir>'])
+    if args['couplings']:
+      make_html_in_couplings_dir(args['<couplings_dir>'])
+
+
